@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha512"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -516,6 +517,8 @@ func (a *Agent) listenAndServeGRPC() error {
 		return nil
 	}
 
+	return fmt.Errorf("gRPC not supported with TLS credential reloading")
+
 	a.xdsServer = &xds.Server{
 		Logger:       a.logger,
 		CfgMgr:       a.proxyConfig,
@@ -645,7 +648,7 @@ func (a *Agent) listenHTTP() ([]*HTTPServer, error) {
 				if err != nil {
 					return err
 				}
-				l = tls.NewListener(l, tlscfg)
+				l = &tlsListener{Listener: l, config: tlscfg}
 			}
 			srv := &HTTPServer{
 				Server: &http.Server{
@@ -3339,6 +3342,10 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	snap := a.snapshotCheckState()
 	defer a.restoreCheckState(snap)
 
+	if err := a.reloadTLScredentials(newCfg); err != nil {
+		a.logger.Println("[ERR] agent: Failed to reload TLS credentials:", err)
+	}
+
 	// First unload all checks, services, and metadata. This lets us begin the reload
 	// with a clean slate.
 	if err := a.unloadProxies(); err != nil {
@@ -3389,6 +3396,52 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	a.State.SetDiscardCheckOutput(newCfg.DiscardCheckOutput)
 
 	return nil
+}
+
+func (a *Agent) reloadTLScredentials(newCfg *config.RuntimeConfig) error {
+	tlscfg, err := newCfg.IncomingHTTPSConfig()
+	if err != nil {
+		return err
+	}
+
+	a.shutdownLock.Lock()
+	defer a.shutdownLock.Unlock()
+
+	for _, srv := range a.httpServers {
+		if ln, ok := srv.ln.(*tlsListener); ok {
+			ln.update(tlscfg.Certificates, tlscfg.RootCAs)
+		}
+	}
+
+	return nil
+}
+
+type tlsListener struct {
+	net.Listener
+	configMu sync.Mutex
+	config   *tls.Config
+}
+
+func (ln *tlsListener) Accept() (net.Conn, error) {
+	c, err := ln.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	ln.configMu.Lock()
+	c = tls.Server(c, ln.config)
+	ln.configMu.Unlock()
+
+	return c, nil
+}
+
+func (ln *tlsListener) update(certs []tls.Certificate, roots *x509.CertPool) {
+	ln.configMu.Lock()
+	newCfg := ln.config.Clone()
+	newCfg.Certificates = certs
+	newCfg.RootCAs = roots
+	ln.config = newCfg
+	ln.configMu.Unlock()
 }
 
 // registerCache configures the cache and registers all the supported
